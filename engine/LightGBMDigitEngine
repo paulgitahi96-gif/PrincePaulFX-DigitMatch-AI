@@ -2,27 +2,28 @@
 ============================================================
 PRINCE PAUL FX
 DIGITMATCH AI ANALYZER
-LIGHTGBM ENGINE
-VERSION 2.0
+LIGHTGBM DIGIT ENGINE
+VERSION 2.1
 ============================================================
 
 Purpose:
-    Train, validate, save, load and serve LightGBM
-    multiclass digit prediction models.
+    Train, validate, save, load and serve a LightGBM
+    multiclass model for NEXT-DIGIT prediction.
 
 Target:
-    Predict the NEXT digit (0-9).
+    Digit 0-9
 
 Important:
-    This engine does not execute trades.
+    This engine only analyzes/predicts.
+    It does NOT execute trades.
 
-Validation:
-    Chronological validation is used to reduce
-    look-ahead leakage.
+Compatibility:
+    Preserves the LightGBMDigitEngine class name expected
+    by the existing train.py.
 
 Model persistence:
-    Uses joblib to save/load the sklearn LightGBM
-    classifier consistently.
+    Uses joblib so the complete LGBMClassifier can be
+    restored correctly.
 
 ============================================================
 """
@@ -45,28 +46,25 @@ from lightgbm import LGBMClassifier
 
 NUM_CLASSES = 10
 
-DEFAULT_MODEL_PATH = (
+DEFAULT_MODEL_PATH = Path(
     "models/lightgbm_digitmatch.joblib"
 )
 
-DEFAULT_METADATA_PATH = (
+DEFAULT_METADATA_PATH = Path(
     "models/lightgbm_metadata.json"
 )
 
 
 # ============================================================
-# LIGHTGBM ENGINE
+# LIGHTGBM DIGIT ENGINE
 # ============================================================
 
-class LightGBMEngine:
+class LightGBMDigitEngine:
     """
-    LightGBM multiclass digit prediction engine.
+    LightGBM multiclass engine for predicting the next digit.
 
-    Input:
-        Feature matrix containing historical tick features.
-
-    Target:
-        Next digit, values 0-9.
+    Classes:
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9
     """
 
     def __init__(
@@ -89,9 +87,9 @@ class LightGBMEngine:
 
         self.feature_names: list[str] = []
 
-        self.training_rows: int = 0
+        self.training_rows = 0
 
-        self.validation_rows: int = 0
+        self.validation_rows = 0
 
         self.validation_accuracy: Optional[
             float
@@ -107,7 +105,7 @@ class LightGBMEngine:
 
 
     # ========================================================
-    # MODEL CREATION
+    # CREATE MODEL
     # ========================================================
 
     def _create_model(
@@ -115,8 +113,6 @@ class LightGBMEngine:
     ) -> LGBMClassifier:
         """
         Create the LightGBM classifier.
-
-        The parameters are intentionally conservative.
         """
 
         return LGBMClassifier(
@@ -148,12 +144,11 @@ class LightGBMEngine:
             n_jobs=-1,
 
             verbosity=-1,
-
         )
 
 
     # ========================================================
-    # FEATURE PREPARATION
+    # PREPARE FEATURES
     # ========================================================
 
     @staticmethod
@@ -161,7 +156,7 @@ class LightGBMEngine:
         X: pd.DataFrame | np.ndarray,
     ) -> pd.DataFrame:
         """
-        Normalize feature input into a DataFrame.
+        Convert input into a clean DataFrame.
         """
 
         if isinstance(
@@ -177,8 +172,6 @@ class LightGBMEngine:
                 X
             )
 
-        # Replace invalid numerical values.
-
         dataframe = dataframe.replace(
             [np.inf, -np.inf],
             np.nan,
@@ -192,7 +185,7 @@ class LightGBMEngine:
 
 
     # ========================================================
-    # TARGET PREPARATION
+    # PREPARE TARGET
     # ========================================================
 
     @staticmethod
@@ -200,7 +193,7 @@ class LightGBMEngine:
         y,
     ) -> np.ndarray:
         """
-        Validate target digits.
+        Validate target digit classes.
         """
 
         values = np.asarray(
@@ -208,22 +201,20 @@ class LightGBMEngine:
             dtype=int,
         )
 
-        if values.ndim != 1:
-
-            values = values.reshape(
-                -1
-            )
+        values = values.reshape(
+            -1
+        )
 
         invalid = values[
             (values < 0)
-            | (values >= NUM_CLASSES)
+            |
+            (values >= NUM_CLASSES)
         ]
 
         if len(invalid) > 0:
 
             raise ValueError(
-                "Target contains invalid "
-                "digit classes: "
+                "Invalid digit classes found: "
                 f"{sorted(set(invalid.tolist()))}"
             )
 
@@ -236,18 +227,16 @@ class LightGBMEngine:
 
     def train(
         self,
-        X_train: pd.DataFrame | np.ndarray,
+        X_train,
         y_train,
-        X_validation: Optional[
-            pd.DataFrame | np.ndarray
-        ] = None,
+        X_validation=None,
         y_validation=None,
     ) -> dict[str, Any]:
         """
-        Train LightGBM.
+        Train the LightGBM model.
 
-        If validation data is supplied, it is used only
-        for evaluation and early stopping.
+        Training and validation data are expected to have
+        already been split chronologically by train.py.
         """
 
         X_train_df = (
@@ -268,11 +257,11 @@ class LightGBMEngine:
 
             raise ValueError(
                 "X_train and y_train "
-                "have different lengths."
+                "lengths do not match."
             )
 
         # ----------------------------------------------------
-        # Check all classes.
+        # Confirm all 10 classes exist.
         # ----------------------------------------------------
 
         present_classes = sorted(
@@ -318,7 +307,9 @@ class LightGBMEngine:
         # Prepare validation.
         # ----------------------------------------------------
 
-        validation_set = None
+        X_validation_df = None
+
+        y_validation_array = None
 
         if (
             X_validation is not None
@@ -345,12 +336,9 @@ class LightGBMEngine:
 
                 raise ValueError(
                     "X_validation and "
-                    "y_validation have "
-                    "different lengths."
+                    "y_validation lengths "
+                    "do not match."
                 )
-
-            # Make sure validation columns
-            # match training columns.
 
             X_validation_df = (
                 X_validation_df.reindex(
@@ -359,20 +347,14 @@ class LightGBMEngine:
                 )
             )
 
-            validation_set = (
-                X_validation_df,
-                y_validation_array,
-            )
-
         # ----------------------------------------------------
-        # Train.
+        # Fit model.
         # ----------------------------------------------------
 
-        if validation_set is not None:
-
-            X_val, y_val = (
-                validation_set
-            )
+        if (
+            X_validation_df is not None
+            and y_validation_array is not None
+        ):
 
             self.model.fit(
 
@@ -382,12 +364,10 @@ class LightGBMEngine:
 
                 eval_set=[
                     (
-                        X_val,
-                        y_val,
+                        X_validation_df,
+                        y_validation_array,
                     )
                 ],
-
-                callbacks=[],
 
             )
 
@@ -402,22 +382,31 @@ class LightGBMEngine:
             )
 
         # ----------------------------------------------------
-        # Store metadata.
+        # Store row counts.
         # ----------------------------------------------------
 
         self.training_rows = (
             len(X_train_df)
         )
 
-        if validation_set is not None:
+        self.validation_rows = (
+            len(X_validation_df)
+            if X_validation_df is not None
+            else 0
+        )
 
-            self.validation_rows = (
-                len(X_val)
-            )
+        # ----------------------------------------------------
+        # Validation metrics.
+        # ----------------------------------------------------
+
+        if (
+            X_validation_df is not None
+            and y_validation_array is not None
+        ):
 
             predictions = (
                 self.model.predict(
-                    X_val
+                    X_validation_df
                 )
             )
 
@@ -425,8 +414,14 @@ class LightGBMEngine:
                 float(
                     np.mean(
                         predictions
-                        == y_val
+                        == y_validation_array
                     )
+                )
+            )
+
+            probabilities = (
+                self.model.predict_proba(
+                    X_validation_df
                 )
             )
 
@@ -436,16 +431,10 @@ class LightGBMEngine:
                     log_loss
                 )
 
-                probabilities = (
-                    self.model.predict_proba(
-                        X_val
-                    )
-                )
-
                 self.validation_logloss = (
                     float(
                         log_loss(
-                            y_val,
+                            y_validation_array,
                             probabilities,
                             labels=list(
                                 range(
@@ -458,9 +447,7 @@ class LightGBMEngine:
 
             except Exception:
 
-                self.validation_logloss = (
-                    None
-                )
+                self.validation_logloss = None
 
         # ----------------------------------------------------
         # Best iteration.
@@ -487,11 +474,9 @@ class LightGBMEngine:
                 ValueError,
             ):
 
-                self.best_iteration = (
-                    None
-                )
+                self.best_iteration = None
 
-        report = {
+        return {
             "training_rows": (
                 self.training_rows
             ),
@@ -515,8 +500,6 @@ class LightGBMEngine:
             ),
         }
 
-        return report
-
 
     # ========================================================
     # PREDICT PROBABILITIES
@@ -524,17 +507,17 @@ class LightGBMEngine:
 
     def predict_proba(
         self,
-        X: pd.DataFrame | np.ndarray,
+        X,
     ) -> np.ndarray:
         """
-        Return probability for every digit 0-9.
+        Return probabilities for digits 0-9.
         """
 
         if self.model is None:
 
             raise RuntimeError(
-                "LightGBM model is not loaded "
-                "or trained."
+                "LightGBM model is not "
+                "trained or loaded."
             )
 
         dataframe = (
@@ -542,6 +525,10 @@ class LightGBMEngine:
                 X
             )
         )
+
+        # ----------------------------------------------------
+        # Align live features to training features.
+        # ----------------------------------------------------
 
         if self.feature_names:
 
@@ -587,12 +574,12 @@ class LightGBMEngine:
 
 
     # ========================================================
-    # PREDICT DIGIT
+    # PREDICT
     # ========================================================
 
     def predict(
         self,
-        X: pd.DataFrame | np.ndarray,
+        X,
     ) -> np.ndarray:
         """
         Return the highest-probability digit.
@@ -616,11 +603,11 @@ class LightGBMEngine:
 
     def predict_single(
         self,
-        X: pd.DataFrame | np.ndarray,
+        X,
     ) -> dict[str, Any]:
         """
-        Produce a detailed prediction for one
-        feature row.
+        Return detailed prediction information
+        for exactly one feature row.
         """
 
         probabilities = (
@@ -632,16 +619,14 @@ class LightGBMEngine:
         if probabilities.shape[0] != 1:
 
             raise ValueError(
-                "predict_single expects "
+                "predict_single requires "
                 "exactly one feature row."
             )
 
-        probability_row = (
-            probabilities[0]
-        )
+        row = probabilities[0]
 
         ranked_indices = np.argsort(
-            probability_row
+            row
         )[::-1]
 
         predicted_digit = int(
@@ -649,7 +634,7 @@ class LightGBMEngine:
         )
 
         predicted_probability = float(
-            probability_row[
+            row[
                 predicted_digit
             ]
         )
@@ -659,7 +644,7 @@ class LightGBMEngine:
         )
 
         second_probability = float(
-            probability_row[
+            row[
                 second_digit
             ]
         )
@@ -681,20 +666,18 @@ class LightGBMEngine:
                 predicted_probability
                 - second_probability
             ),
+            "ranked_digits": [
+                int(index)
+                for index in ranked_indices
+            ],
             "probabilities": {
                 str(digit): float(
-                    probability_row[
-                        digit
-                    ]
+                    row[digit]
                 )
                 for digit in range(
                     NUM_CLASSES
                 )
             },
-            "ranked_digits": [
-                int(index)
-                for index in ranked_indices
-            ],
         }
 
 
@@ -704,11 +687,11 @@ class LightGBMEngine:
 
     def top_candidates(
         self,
-        X: pd.DataFrame | np.ndarray,
+        X,
         top_n: int = 3,
     ) -> list[dict[str, Any]]:
         """
-        Return the strongest candidate digits.
+        Return the strongest digit candidates.
         """
 
         if top_n < 1:
@@ -718,7 +701,7 @@ class LightGBMEngine:
             )
 
         top_n = min(
-            top_n,
+            int(top_n),
             NUM_CLASSES,
         )
 
@@ -731,30 +714,38 @@ class LightGBMEngine:
         if probabilities.shape[0] != 1:
 
             raise ValueError(
-                "top_candidates expects "
+                "top_candidates requires "
                 "exactly one feature row."
             )
 
         row = probabilities[0]
 
-        indices = np.argsort(
+        ranked = np.argsort(
             row
         )[::-1][:top_n]
 
-        return [
-            {
-                "digit": int(
-                    index
-                ),
-                "probability": float(
-                    row[index]
-                ),
-                "rank": rank + 1,
-            }
-            for rank, index in enumerate(
-                indices
+        candidates = []
+
+        for rank, digit in enumerate(
+            ranked,
+            start=1,
+        ):
+
+            candidates.append(
+                {
+                    "digit": int(
+                        digit
+                    ),
+                    "probability": float(
+                        row[digit]
+                    ),
+                    "rank": int(
+                        rank
+                    ),
+                }
             )
-        ]
+
+        return candidates
 
 
     # ========================================================
@@ -771,14 +762,15 @@ class LightGBMEngine:
         ] = None,
     ) -> tuple[Path, Path]:
         """
-        Save the complete sklearn LightGBM
-        classifier using joblib.
+        Save the complete sklearn LightGBM model
+        and metadata.
         """
 
         if self.model is None:
 
             raise RuntimeError(
-                "Cannot save an empty model."
+                "Cannot save an empty "
+                "LightGBM model."
             )
 
         model_destination = Path(
@@ -804,7 +796,7 @@ class LightGBMEngine:
         )
 
         # ----------------------------------------------------
-        # Save sklearn wrapper.
+        # Save complete sklearn model.
         # ----------------------------------------------------
 
         joblib.dump(
@@ -813,17 +805,26 @@ class LightGBMEngine:
         )
 
         # ----------------------------------------------------
-        # Save metadata separately.
+        # Save metadata.
         # ----------------------------------------------------
 
         metadata = {
-            "engine": "LightGBM",
-            "version": "2.0",
+            "engine": (
+                "LightGBM"
+            ),
+            "class_name": (
+                "LightGBMDigitEngine"
+            ),
+            "version": (
+                "2.1"
+            ),
             "num_classes": (
                 NUM_CLASSES
             ),
-            "feature_count": len(
-                self.feature_names
+            "feature_count": (
+                len(
+                    self.feature_names
+                )
             ),
             "feature_names": (
                 self.feature_names
@@ -843,7 +844,9 @@ class LightGBMEngine:
             "best_iteration": (
                 self.best_iteration
             ),
-            "model_format": "joblib",
+            "model_format": (
+                "joblib"
+            ),
         }
 
         with open(
@@ -857,10 +860,6 @@ class LightGBMEngine:
                 file,
                 indent=2,
             )
-
-        # ----------------------------------------------------
-        # Update paths.
-        # ----------------------------------------------------
 
         self.model_path = (
             model_destination
@@ -890,8 +889,7 @@ class LightGBMEngine:
         ] = None,
     ) -> None:
         """
-        Load the sklearn LightGBM classifier
-        and its metadata.
+        Load the complete LightGBM sklearn model.
         """
 
         model_source = Path(
@@ -914,7 +912,7 @@ class LightGBMEngine:
             )
 
         # ----------------------------------------------------
-        # Load model.
+        # Load complete sklearn model.
         # ----------------------------------------------------
 
         loaded_model = joblib.load(
@@ -927,8 +925,9 @@ class LightGBMEngine:
         ):
 
             raise TypeError(
-                "Loaded file is not a "
-                "LightGBM sklearn classifier."
+                "The saved LightGBM file "
+                "does not contain an "
+                "LGBMClassifier."
             )
 
         self.model = (
@@ -936,7 +935,7 @@ class LightGBMEngine:
         )
 
         # ----------------------------------------------------
-        # Load metadata if available.
+        # Load metadata.
         # ----------------------------------------------------
 
         if metadata_source.exists():
@@ -1009,6 +1008,10 @@ class LightGBMEngine:
                     )
                 )
 
+        # ----------------------------------------------------
+        # Update paths.
+        # ----------------------------------------------------
+
         self.model_path = (
             model_source
         )
@@ -1022,9 +1025,11 @@ class LightGBMEngine:
     # STATUS
     # ========================================================
 
-    def status(self) -> dict[str, Any]:
+    def status(
+        self,
+    ) -> dict[str, Any]:
         """
-        Return engine status for the dashboard.
+        Return current engine status.
         """
 
         loaded = (
@@ -1032,17 +1037,35 @@ class LightGBMEngine:
         )
 
         return {
-            "engine": "LightGBM",
-            "loaded": loaded,
-            "trained": loaded,
-            "model_path": str(
-                self.model_path
+            "engine": (
+                "LightGBM"
             ),
-            "metadata_path": str(
-                self.metadata_path
+            "class_name": (
+                "LightGBMDigitEngine"
             ),
-            "feature_count": len(
-                self.feature_names
+            "version": (
+                "2.1"
+            ),
+            "loaded": (
+                loaded
+            ),
+            "trained": (
+                loaded
+            ),
+            "model_path": (
+                str(
+                    self.model_path
+                )
+            ),
+            "metadata_path": (
+                str(
+                    self.metadata_path
+                )
+            ),
+            "feature_count": (
+                len(
+                    self.feature_names
+                )
             ),
             "training_rows": (
                 self.training_rows
@@ -1066,7 +1089,18 @@ class LightGBMEngine:
 
 
 # ============================================================
-# COMPATIBILITY HELPERS
+# COMPATIBILITY ALIAS
+# ============================================================
+
+# Allows code using the shorter class name to work too.
+
+LightGBMEngine = (
+    LightGBMDigitEngine
+)
+
+
+# ============================================================
+# SIMPLE TRAINING HELPER
 # ============================================================
 
 def train_lightgbm(
@@ -1074,13 +1108,14 @@ def train_lightgbm(
     y_train,
     X_validation=None,
     y_validation=None,
-) -> LightGBMEngine:
+) -> LightGBMDigitEngine:
     """
-    Convenience function compatible with a simple
-    training workflow.
+    Convenience training function.
     """
 
-    engine = LightGBMEngine()
+    engine = (
+        LightGBMDigitEngine()
+    )
 
     engine.train(
         X_train=X_train,
@@ -1093,34 +1128,38 @@ def train_lightgbm(
 
 
 # ============================================================
-# TEST
+# MODULE TEST
 # ============================================================
 
 if __name__ == "__main__":
 
     print("=" * 64)
+
     print(
         "PRINCE PAUL FX"
     )
+
     print(
-        "LIGHTGBM ENGINE"
+        "LIGHTGBM DIGIT ENGINE"
     )
+
     print(
-        "VERSION 2.0"
+        "VERSION 2.1"
     )
+
     print("=" * 64)
 
-    engine = LightGBMEngine()
-
-    print()
-    print(
-        "Engine initialized successfully."
+    engine = (
+        LightGBMDigitEngine()
     )
 
     print()
+
     print(
-        "Status:"
+        "LightGBMDigitEngine initialized successfully."
     )
+
+    print()
 
     print(
         json.dumps(
