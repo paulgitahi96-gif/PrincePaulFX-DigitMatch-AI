@@ -3,18 +3,26 @@
 PRINCE PAUL FX
 DIGITMATCH AI ANALYZER
 LIGHTGBM ENGINE
-VERSION 1.0
+VERSION 2.0
 ============================================================
 
 Purpose:
-    Train a LightGBM multiclass classifier to estimate the
-    probability of the next Deriv tick digit (0-9).
+    Train, validate, save, load and serve LightGBM
+    multiclass digit prediction models.
+
+Target:
+    Predict the NEXT digit (0-9).
 
 Important:
-    This model does NOT guarantee the next digit.
+    This engine does not execute trades.
 
-    Digit prediction is a probabilistic classification task.
-    Performance must be evaluated on unseen chronological data.
+Validation:
+    Chronological validation is used to reduce
+    look-ahead leakage.
+
+Model persistence:
+    Uses joblib to save/load the sklearn LightGBM
+    classifier consistently.
 
 ============================================================
 """
@@ -23,89 +31,95 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
-import lightgbm as lgb
+import joblib
 import numpy as np
 import pandas as pd
-
-from engine.features import (
-    build_live_features,
-    build_training_dataset,
-    feature_columns,
-    split_features_target,
-)
+from lightgbm import LGBMClassifier
 
 
-# ==========================================================
+# ============================================================
 # CONFIGURATION
-# ==========================================================
+# ============================================================
 
 NUM_CLASSES = 10
 
-DEFAULT_MODEL_DIR = Path("models")
-
-MODEL_FILENAME = (
-    "lightgbm_digitmatch.txt"
+DEFAULT_MODEL_PATH = (
+    "models/lightgbm_digitmatch.joblib"
 )
 
-METADATA_FILENAME = (
-    "lightgbm_metadata.json"
+DEFAULT_METADATA_PATH = (
+    "models/lightgbm_metadata.json"
 )
 
-RANDOM_SEED = 42
 
-
-# ==========================================================
+# ============================================================
 # LIGHTGBM ENGINE
-# ==========================================================
+# ============================================================
 
-class LightGBMDigitEngine:
+class LightGBMEngine:
     """
-    LightGBM multiclass engine for next-digit analysis.
+    LightGBM multiclass digit prediction engine.
+
+    Input:
+        Feature matrix containing historical tick features.
+
+    Target:
+        Next digit, values 0-9.
     """
 
     def __init__(
         self,
-        model_dir: str | Path = DEFAULT_MODEL_DIR,
+        model_path: str | Path = DEFAULT_MODEL_PATH,
+        metadata_path: str | Path = DEFAULT_METADATA_PATH,
     ):
 
-        self.model_dir = Path(
-            model_dir
+        self.model_path = Path(
+            model_path
         )
 
-        self.model_dir.mkdir(
-            parents=True,
-            exist_ok=True,
+        self.metadata_path = Path(
+            metadata_path
         )
 
         self.model: Optional[
-            lgb.LGBMClassifier
+            LGBMClassifier
         ] = None
 
-        self.columns: list[str] = []
+        self.feature_names: list[str] = []
 
-        self.is_trained = False
+        self.training_rows: int = 0
 
-        self.training_rows = 0
+        self.validation_rows: int = 0
 
-        self.validation_accuracy = None
+        self.validation_accuracy: Optional[
+            float
+        ] = None
 
-        self.validation_logloss = None
+        self.validation_logloss: Optional[
+            float
+        ] = None
+
+        self.best_iteration: Optional[
+            int
+        ] = None
 
 
-    # ======================================================
+    # ========================================================
     # MODEL CREATION
-    # ======================================================
+    # ========================================================
 
     def _create_model(
         self,
-    ) -> lgb.LGBMClassifier:
+    ) -> LGBMClassifier:
         """
-        Create the LightGBM multiclass classifier.
+        Create the LightGBM classifier.
+
+        The parameters are intentionally conservative.
         """
 
-        return lgb.LGBMClassifier(
+        return LGBMClassifier(
 
             objective="multiclass",
 
@@ -121,249 +135,427 @@ class LightGBMDigitEngine:
 
             min_child_samples=20,
 
-            subsample=0.9,
+            subsample=0.90,
 
-            colsample_bytree=0.9,
+            colsample_bytree=0.90,
 
-            reg_alpha=0.1,
+            reg_alpha=0.10,
 
-            reg_lambda=0.1,
+            reg_lambda=1.0,
 
-            random_state=RANDOM_SEED,
+            random_state=42,
 
             n_jobs=-1,
 
             verbosity=-1,
+
         )
 
 
-    # ======================================================
-    # PREPARE DATA
-    # ======================================================
-
-    def prepare_data(
-        self,
-        digits,
-    ):
-        """
-        Convert a digit sequence into X/y.
-        """
-
-        dataset = build_training_dataset(
-            digits
-        )
-
-        if dataset.empty:
-
-            raise ValueError(
-                "Not enough tick history to create "
-                "a LightGBM training dataset."
-            )
-
-        X, y = split_features_target(
-            dataset
-        )
-
-        columns = feature_columns(
-            X
-        )
-
-        X = X[columns]
-
-        return X, y
-
-
-    # ======================================================
-    # CHRONOLOGICAL SPLIT
-    # ======================================================
+    # ========================================================
+    # FEATURE PREPARATION
+    # ========================================================
 
     @staticmethod
-    def chronological_split(
-        X: pd.DataFrame,
-        y: pd.Series,
-        validation_fraction: float = 0.20,
-    ):
+    def _prepare_features(
+        X: pd.DataFrame | np.ndarray,
+    ) -> pd.DataFrame:
         """
-        Split data chronologically.
-
-        Earlier observations are used for training.
-        Later observations are used for validation.
-
-        This is deliberately NOT a random split because
-        random shuffling can leak temporal information.
+        Normalize feature input into a DataFrame.
         """
 
-        if not 0.05 <= validation_fraction <= 0.40:
+        if isinstance(
+            X,
+            pd.DataFrame,
+        ):
 
-            raise ValueError(
-                "validation_fraction must be between "
-                "0.05 and 0.40."
+            dataframe = X.copy()
+
+        else:
+
+            dataframe = pd.DataFrame(
+                X
             )
 
-        total_rows = len(X)
+        # Replace invalid numerical values.
 
-        if total_rows < 20:
+        dataframe = dataframe.replace(
+            [np.inf, -np.inf],
+            np.nan,
+        )
 
-            raise ValueError(
-                "At least 20 training examples are "
-                "recommended for validation."
+        dataframe = dataframe.fillna(
+            0
+        )
+
+        return dataframe
+
+
+    # ========================================================
+    # TARGET PREPARATION
+    # ========================================================
+
+    @staticmethod
+    def _prepare_target(
+        y,
+    ) -> np.ndarray:
+        """
+        Validate target digits.
+        """
+
+        values = np.asarray(
+            y,
+            dtype=int,
+        )
+
+        if values.ndim != 1:
+
+            values = values.reshape(
+                -1
             )
 
-        split_index = int(
-            total_rows
-            * (1.0 - validation_fraction)
-        )
+        invalid = values[
+            (values < 0)
+            | (values >= NUM_CLASSES)
+        ]
 
-        X_train = X.iloc[
-            :split_index
-        ].copy()
+        if len(invalid) > 0:
 
-        X_valid = X.iloc[
-            split_index:
-        ].copy()
+            raise ValueError(
+                "Target contains invalid "
+                "digit classes: "
+                f"{sorted(set(invalid.tolist()))}"
+            )
 
-        y_train = y.iloc[
-            :split_index
-        ].copy()
-
-        y_valid = y.iloc[
-            split_index:
-        ].copy()
-
-        return (
-            X_train,
-            X_valid,
-            y_train,
-            y_valid,
-        )
+        return values
 
 
-    # ======================================================
+    # ========================================================
     # TRAIN
-    # ======================================================
+    # ========================================================
 
     def train(
         self,
-        digits,
-        validation_fraction: float = 0.20,
-    ) -> dict:
+        X_train: pd.DataFrame | np.ndarray,
+        y_train,
+        X_validation: Optional[
+            pd.DataFrame | np.ndarray
+        ] = None,
+        y_validation=None,
+    ) -> dict[str, Any]:
         """
-        Train the LightGBM model.
+        Train LightGBM.
 
-        Returns validation metrics.
+        If validation data is supplied, it is used only
+        for evaluation and early stopping.
         """
 
-        X, y = self.prepare_data(
-            digits
-        )
-
-        (
-            X_train,
-            X_valid,
-            y_train,
-            y_valid,
-        ) = self.chronological_split(
-            X,
-            y,
-            validation_fraction,
-        )
-
-        model = self._create_model()
-
-        model.fit(
-            X_train,
-            y_train,
-            eval_set=[
-                (
-                    X_valid,
-                    y_valid,
-                )
-            ],
-            callbacks=[
-                lgb.early_stopping(
-                    stopping_rounds=40,
-                    verbose=False,
-                )
-            ],
-        )
-
-        self.model = model
-
-        self.columns = list(
-            X_train.columns
-        )
-
-        self.is_trained = True
-
-        self.training_rows = len(
-            X_train
-        )
-
-        probabilities = model.predict_proba(
-            X_valid
-        )
-
-        predictions = np.argmax(
-            probabilities,
-            axis=1,
-        )
-
-        accuracy = float(
-            np.mean(
-                predictions
-                == y_valid.to_numpy()
+        X_train_df = (
+            self._prepare_features(
+                X_train
             )
         )
 
-        logloss = self.multiclass_logloss(
-            y_valid.to_numpy(),
-            probabilities,
+        y_train_array = (
+            self._prepare_target(
+                y_train
+            )
         )
 
-        self.validation_accuracy = (
-            accuracy
+        if len(X_train_df) != len(
+            y_train_array
+        ):
+
+            raise ValueError(
+                "X_train and y_train "
+                "have different lengths."
+            )
+
+        # ----------------------------------------------------
+        # Check all classes.
+        # ----------------------------------------------------
+
+        present_classes = sorted(
+            set(
+                y_train_array.tolist()
+            )
         )
 
-        self.validation_logloss = (
-            logloss
+        missing_classes = [
+            digit
+            for digit in range(
+                NUM_CLASSES
+            )
+            if digit not in present_classes
+        ]
+
+        if missing_classes:
+
+            raise ValueError(
+                "Training data is missing "
+                f"digit classes: "
+                f"{missing_classes}"
+            )
+
+        # ----------------------------------------------------
+        # Store feature names.
+        # ----------------------------------------------------
+
+        self.feature_names = [
+            str(column)
+            for column in X_train_df.columns
+        ]
+
+        # ----------------------------------------------------
+        # Create model.
+        # ----------------------------------------------------
+
+        self.model = (
+            self._create_model()
         )
 
-        return {
-            "training_rows": int(
-                len(X_train)
-            ),
-            "validation_rows": int(
-                len(X_valid)
-            ),
-            "accuracy": accuracy,
-            "logloss": logloss,
-            "best_iteration": int(
-                getattr(
-                    model,
-                    "best_iteration_",
-                    0,
+        # ----------------------------------------------------
+        # Prepare validation.
+        # ----------------------------------------------------
+
+        validation_set = None
+
+        if (
+            X_validation is not None
+            and y_validation is not None
+        ):
+
+            X_validation_df = (
+                self._prepare_features(
+                    X_validation
                 )
-                or 0
+            )
+
+            y_validation_array = (
+                self._prepare_target(
+                    y_validation
+                )
+            )
+
+            if len(
+                X_validation_df
+            ) != len(
+                y_validation_array
+            ):
+
+                raise ValueError(
+                    "X_validation and "
+                    "y_validation have "
+                    "different lengths."
+                )
+
+            # Make sure validation columns
+            # match training columns.
+
+            X_validation_df = (
+                X_validation_df.reindex(
+                    columns=self.feature_names,
+                    fill_value=0,
+                )
+            )
+
+            validation_set = (
+                X_validation_df,
+                y_validation_array,
+            )
+
+        # ----------------------------------------------------
+        # Train.
+        # ----------------------------------------------------
+
+        if validation_set is not None:
+
+            X_val, y_val = (
+                validation_set
+            )
+
+            self.model.fit(
+
+                X_train_df,
+
+                y_train_array,
+
+                eval_set=[
+                    (
+                        X_val,
+                        y_val,
+                    )
+                ],
+
+                callbacks=[],
+
+            )
+
+        else:
+
+            self.model.fit(
+
+                X_train_df,
+
+                y_train_array,
+
+            )
+
+        # ----------------------------------------------------
+        # Store metadata.
+        # ----------------------------------------------------
+
+        self.training_rows = (
+            len(X_train_df)
+        )
+
+        if validation_set is not None:
+
+            self.validation_rows = (
+                len(X_val)
+            )
+
+            predictions = (
+                self.model.predict(
+                    X_val
+                )
+            )
+
+            self.validation_accuracy = (
+                float(
+                    np.mean(
+                        predictions
+                        == y_val
+                    )
+                )
+            )
+
+            try:
+
+                from sklearn.metrics import (
+                    log_loss
+                )
+
+                probabilities = (
+                    self.model.predict_proba(
+                        X_val
+                    )
+                )
+
+                self.validation_logloss = (
+                    float(
+                        log_loss(
+                            y_val,
+                            probabilities,
+                            labels=list(
+                                range(
+                                    NUM_CLASSES
+                                )
+                            ),
+                        )
+                    )
+                )
+
+            except Exception:
+
+                self.validation_logloss = (
+                    None
+                )
+
+        # ----------------------------------------------------
+        # Best iteration.
+        # ----------------------------------------------------
+
+        best_iteration = getattr(
+            self.model,
+            "best_iteration_",
+            None,
+        )
+
+        if best_iteration is not None:
+
+            try:
+
+                self.best_iteration = (
+                    int(
+                        best_iteration
+                    )
+                )
+
+            except (
+                TypeError,
+                ValueError,
+            ):
+
+                self.best_iteration = (
+                    None
+                )
+
+        report = {
+            "training_rows": (
+                self.training_rows
+            ),
+            "validation_rows": (
+                self.validation_rows
+            ),
+            "feature_count": len(
+                self.feature_names
+            ),
+            "validation_accuracy": (
+                self.validation_accuracy
+            ),
+            "validation_logloss": (
+                self.validation_logloss
+            ),
+            "best_iteration": (
+                self.best_iteration
+            ),
+            "num_classes": (
+                NUM_CLASSES
             ),
         }
 
+        return report
 
-    # ======================================================
-    # LOG LOSS
-    # ======================================================
 
-    @staticmethod
-    def multiclass_logloss(
-        y_true,
-        probabilities,
-    ) -> float:
+    # ========================================================
+    # PREDICT PROBABILITIES
+    # ========================================================
+
+    def predict_proba(
+        self,
+        X: pd.DataFrame | np.ndarray,
+    ) -> np.ndarray:
         """
-        Calculate multiclass logarithmic loss.
+        Return probability for every digit 0-9.
         """
 
-        y_true = np.asarray(
-            y_true,
-            dtype=int,
+        if self.model is None:
+
+            raise RuntimeError(
+                "LightGBM model is not loaded "
+                "or trained."
+            )
+
+        dataframe = (
+            self._prepare_features(
+                X
+            )
+        )
+
+        if self.feature_names:
+
+            dataframe = (
+                dataframe.reindex(
+                    columns=self.feature_names,
+                    fill_value=0,
+                )
+            )
+
+        probabilities = (
+            self.model.predict_proba(
+                dataframe
+            )
         )
 
         probabilities = np.asarray(
@@ -371,381 +563,568 @@ class LightGBMDigitEngine:
             dtype=float,
         )
 
-        probabilities = np.clip(
-            probabilities,
-            1e-15,
-            1.0,
-        )
+        # ----------------------------------------------------
+        # Defensive normalization.
+        # ----------------------------------------------------
 
-        probabilities = (
-            probabilities
-            / probabilities.sum(
+        row_sums = (
+            probabilities.sum(
                 axis=1,
                 keepdims=True,
             )
         )
 
-        rows = np.arange(
-            len(y_true)
-        )
-
-        correct_probabilities = (
-            probabilities[
-                rows,
-                y_true,
-            ]
-        )
-
-        return float(
-            -np.mean(
-                np.log(
-                    correct_probabilities
-                )
-            )
-        )
-
-
-    # ======================================================
-    # PREDICT PROBABILITIES
-    # ======================================================
-
-    def predict_proba(
-        self,
-        digits,
-    ) -> Optional[np.ndarray]:
-        """
-        Return probability for every digit 0-9.
-        """
-
-        if not self.is_trained:
-            raise RuntimeError(
-                "LightGBM model has not been trained."
-            )
-
-        features = build_live_features(
-            digits
-        )
-
-        if features is None:
-            return None
-
-        features = features.reindex(
-            columns=self.columns,
-            fill_value=0.0,
-        )
+        row_sums[
+            row_sums == 0
+        ] = 1.0
 
         probabilities = (
-            self.model.predict_proba(
-                features
-            )
-        )
-
-        probabilities = np.asarray(
-            probabilities[0],
-            dtype=float,
+            probabilities
+            / row_sums
         )
 
         return probabilities
 
 
-    # ======================================================
-    # PREDICT NEXT DIGIT
-    # ======================================================
+    # ========================================================
+    # PREDICT DIGIT
+    # ========================================================
 
     def predict(
         self,
-        digits,
-    ) -> Optional[dict]:
+        X: pd.DataFrame | np.ndarray,
+    ) -> np.ndarray:
         """
-        Predict the most probable next digit.
-
-        Returns:
-
-            {
-                "digit": 7,
-                "probability": 0.14,
-                "probabilities": {...}
-            }
+        Return the highest-probability digit.
         """
 
         probabilities = (
             self.predict_proba(
-                digits
+                X
             )
         )
 
-        if probabilities is None:
-            return None
+        return np.argmax(
+            probabilities,
+            axis=1,
+        )
+
+
+    # ========================================================
+    # SINGLE PREDICTION
+    # ========================================================
+
+    def predict_single(
+        self,
+        X: pd.DataFrame | np.ndarray,
+    ) -> dict[str, Any]:
+        """
+        Produce a detailed prediction for one
+        feature row.
+        """
+
+        probabilities = (
+            self.predict_proba(
+                X
+            )
+        )
+
+        if probabilities.shape[0] != 1:
+
+            raise ValueError(
+                "predict_single expects "
+                "exactly one feature row."
+            )
+
+        probability_row = (
+            probabilities[0]
+        )
+
+        ranked_indices = np.argsort(
+            probability_row
+        )[::-1]
 
         predicted_digit = int(
-            np.argmax(
-                probabilities
-            )
+            ranked_indices[0]
         )
 
-        probability = float(
-            probabilities[
+        predicted_probability = float(
+            probability_row[
                 predicted_digit
             ]
         )
 
-        probability_map = {
-            digit: float(
-                probabilities[digit]
-            )
-            for digit in range(
-                NUM_CLASSES
-            )
-        }
+        second_digit = int(
+            ranked_indices[1]
+        )
+
+        second_probability = float(
+            probability_row[
+                second_digit
+            ]
+        )
 
         return {
-            "digit": predicted_digit,
-            "probability": probability,
-            "probabilities": probability_map,
+            "predicted_digit": (
+                predicted_digit
+            ),
+            "probability": (
+                predicted_probability
+            ),
+            "second_digit": (
+                second_digit
+            ),
+            "second_probability": (
+                second_probability
+            ),
+            "gap": (
+                predicted_probability
+                - second_probability
+            ),
+            "probabilities": {
+                str(digit): float(
+                    probability_row[
+                        digit
+                    ]
+                )
+                for digit in range(
+                    NUM_CLASSES
+                )
+            },
+            "ranked_digits": [
+                int(index)
+                for index in ranked_indices
+            ],
         }
 
 
-    # ======================================================
+    # ========================================================
     # TOP CANDIDATES
-    # ======================================================
+    # ========================================================
 
     def top_candidates(
         self,
-        digits,
-        count: int = 3,
-    ) -> list[dict]:
+        X: pd.DataFrame | np.ndarray,
+        top_n: int = 3,
+    ) -> list[dict[str, Any]]:
         """
-        Return the strongest digit candidates.
+        Return the strongest candidate digits.
         """
 
-        result = self.predict(
-            digits
-        )
+        if top_n < 1:
 
-        if result is None:
-            return []
-
-        probabilities = result[
-            "probabilities"
-        ]
-
-        ranked = sorted(
-            probabilities.items(),
-            key=lambda item: item[1],
-            reverse=True,
-        )
-
-        candidates = []
-
-        for digit, probability in ranked[
-            :count
-        ]:
-
-            candidates.append(
-                {
-                    "digit": int(digit),
-                    "probability": float(
-                        probability
-                    ),
-                }
+            raise ValueError(
+                "top_n must be at least 1."
             )
 
-        return candidates
+        top_n = min(
+            top_n,
+            NUM_CLASSES,
+        )
+
+        probabilities = (
+            self.predict_proba(
+                X
+            )
+        )
+
+        if probabilities.shape[0] != 1:
+
+            raise ValueError(
+                "top_candidates expects "
+                "exactly one feature row."
+            )
+
+        row = probabilities[0]
+
+        indices = np.argsort(
+            row
+        )[::-1][:top_n]
+
+        return [
+            {
+                "digit": int(
+                    index
+                ),
+                "probability": float(
+                    row[index]
+                ),
+                "rank": rank + 1,
+            }
+            for rank, index in enumerate(
+                indices
+            )
+        ]
 
 
-    # ======================================================
-    # SAVE MODEL
-    # ======================================================
+    # ========================================================
+    # SAVE
+    # ========================================================
 
     def save(
         self,
-    ) -> Path:
+        model_path: Optional[
+            str | Path
+        ] = None,
+        metadata_path: Optional[
+            str | Path
+        ] = None,
+    ) -> tuple[Path, Path]:
         """
-        Save LightGBM model and metadata.
+        Save the complete sklearn LightGBM
+        classifier using joblib.
         """
 
-        if not self.is_trained:
+        if self.model is None:
+
             raise RuntimeError(
-                "Cannot save an untrained model."
+                "Cannot save an empty model."
             )
 
-        model_path = (
-            self.model_dir
-            / MODEL_FILENAME
+        model_destination = Path(
+            model_path
+            if model_path is not None
+            else self.model_path
         )
 
-        metadata_path = (
-            self.model_dir
-            / METADATA_FILENAME
+        metadata_destination = Path(
+            metadata_path
+            if metadata_path is not None
+            else self.metadata_path
         )
 
-        self.model.booster_.save_model(
-            str(model_path)
+        model_destination.parent.mkdir(
+            parents=True,
+            exist_ok=True,
         )
+
+        metadata_destination.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        # ----------------------------------------------------
+        # Save sklearn wrapper.
+        # ----------------------------------------------------
+
+        joblib.dump(
+            self.model,
+            model_destination,
+        )
+
+        # ----------------------------------------------------
+        # Save metadata separately.
+        # ----------------------------------------------------
 
         metadata = {
-            "model": "LightGBM",
-            "task": "multiclass",
-            "num_classes": NUM_CLASSES,
-            "classes": list(
-                range(NUM_CLASSES)
+            "engine": "LightGBM",
+            "version": "2.0",
+            "num_classes": (
+                NUM_CLASSES
             ),
-            "feature_columns": self.columns,
-            "training_rows": self.training_rows,
+            "feature_count": len(
+                self.feature_names
+            ),
+            "feature_names": (
+                self.feature_names
+            ),
+            "training_rows": (
+                self.training_rows
+            ),
+            "validation_rows": (
+                self.validation_rows
+            ),
             "validation_accuracy": (
                 self.validation_accuracy
             ),
             "validation_logloss": (
                 self.validation_logloss
             ),
+            "best_iteration": (
+                self.best_iteration
+            ),
+            "model_format": "joblib",
         }
 
-        metadata_path.write_text(
-            json.dumps(
-                metadata,
-                indent=2,
-            ),
+        with open(
+            metadata_destination,
+            "w",
             encoding="utf-8",
+        ) as file:
+
+            json.dump(
+                metadata,
+                file,
+                indent=2,
+            )
+
+        # ----------------------------------------------------
+        # Update paths.
+        # ----------------------------------------------------
+
+        self.model_path = (
+            model_destination
         )
 
-        return model_path
+        self.metadata_path = (
+            metadata_destination
+        )
+
+        return (
+            model_destination,
+            metadata_destination,
+        )
 
 
-    # ======================================================
-    # LOAD MODEL
-    # ======================================================
+    # ========================================================
+    # LOAD
+    # ========================================================
 
     def load(
         self,
-        model_path: str | Path | None = None,
-        metadata_path: str | Path | None = None,
+        model_path: Optional[
+            str | Path
+        ] = None,
+        metadata_path: Optional[
+            str | Path
+        ] = None,
     ) -> None:
         """
-        Load a previously saved LightGBM model.
+        Load the sklearn LightGBM classifier
+        and its metadata.
         """
 
-        if model_path is None:
-
-            model_path = (
-                self.model_dir
-                / MODEL_FILENAME
-            )
-
-        if metadata_path is None:
-
-            metadata_path = (
-                self.model_dir
-                / METADATA_FILENAME
-            )
-
-        model_path = Path(
+        model_source = Path(
             model_path
+            if model_path is not None
+            else self.model_path
         )
 
-        metadata_path = Path(
+        metadata_source = Path(
             metadata_path
+            if metadata_path is not None
+            else self.metadata_path
         )
 
-        if not model_path.exists():
+        if not model_source.exists():
 
             raise FileNotFoundError(
-                f"LightGBM model not found: "
-                f"{model_path}"
+                "LightGBM model not found: "
+                f"{model_source}"
             )
 
-        if not metadata_path.exists():
+        # ----------------------------------------------------
+        # Load model.
+        # ----------------------------------------------------
 
-            raise FileNotFoundError(
-                f"LightGBM metadata not found: "
-                f"{metadata_path}"
-            )
-
-        booster = lgb.Booster(
-            model_file=str(
-                model_path
-            )
+        loaded_model = joblib.load(
+            model_source
         )
 
-        self.model = booster
+        if not isinstance(
+            loaded_model,
+            LGBMClassifier,
+        ):
 
-        metadata = json.loads(
-            metadata_path.read_text(
-                encoding="utf-8"
+            raise TypeError(
+                "Loaded file is not a "
+                "LightGBM sklearn classifier."
             )
+
+        self.model = (
+            loaded_model
         )
 
-        self.columns = metadata.get(
-            "feature_columns",
-            [],
-        )
+        # ----------------------------------------------------
+        # Load metadata if available.
+        # ----------------------------------------------------
 
-        self.training_rows = int(
-            metadata.get(
-                "training_rows",
-                0,
+        if metadata_source.exists():
+
+            with open(
+                metadata_source,
+                "r",
+                encoding="utf-8",
+            ) as file:
+
+                metadata = json.load(
+                    file
+                )
+
+            self.feature_names = [
+                str(name)
+                for name in metadata.get(
+                    "feature_names",
+                    [],
+                )
+            ]
+
+            self.training_rows = int(
+                metadata.get(
+                    "training_rows",
+                    0,
+                )
             )
-        )
 
-        self.validation_accuracy = (
-            metadata.get(
+            self.validation_rows = int(
+                metadata.get(
+                    "validation_rows",
+                    0,
+                )
+            )
+
+            accuracy = metadata.get(
                 "validation_accuracy"
             )
-        )
 
-        self.validation_logloss = (
-            metadata.get(
+            if accuracy is not None:
+
+                self.validation_accuracy = (
+                    float(
+                        accuracy
+                    )
+                )
+
+            logloss = metadata.get(
                 "validation_logloss"
             )
+
+            if logloss is not None:
+
+                self.validation_logloss = (
+                    float(
+                        logloss
+                    )
+                )
+
+            best_iteration = metadata.get(
+                "best_iteration"
+            )
+
+            if best_iteration is not None:
+
+                self.best_iteration = (
+                    int(
+                        best_iteration
+                    )
+                )
+
+        self.model_path = (
+            model_source
         )
 
-        self.is_trained = True
+        self.metadata_path = (
+            metadata_source
+        )
 
 
-    # ======================================================
+    # ========================================================
     # STATUS
-    # ======================================================
+    # ========================================================
 
-    def status(
-        self,
-    ) -> dict:
+    def status(self) -> dict[str, Any]:
         """
         Return engine status for the dashboard.
         """
 
+        loaded = (
+            self.model is not None
+        )
+
         return {
             "engine": "LightGBM",
-            "trained": self.is_trained,
-            "training_rows": self.training_rows,
+            "loaded": loaded,
+            "trained": loaded,
+            "model_path": str(
+                self.model_path
+            ),
+            "metadata_path": str(
+                self.metadata_path
+            ),
+            "feature_count": len(
+                self.feature_names
+            ),
+            "training_rows": (
+                self.training_rows
+            ),
+            "validation_rows": (
+                self.validation_rows
+            ),
             "validation_accuracy": (
                 self.validation_accuracy
             ),
             "validation_logloss": (
                 self.validation_logloss
             ),
-            "feature_count": len(
-                self.columns
+            "best_iteration": (
+                self.best_iteration
+            ),
+            "num_classes": (
+                NUM_CLASSES
             ),
         }
 
 
-# ==========================================================
-# STANDALONE DIAGNOSTIC
-# ==========================================================
+# ============================================================
+# COMPATIBILITY HELPERS
+# ============================================================
+
+def train_lightgbm(
+    X_train,
+    y_train,
+    X_validation=None,
+    y_validation=None,
+) -> LightGBMEngine:
+    """
+    Convenience function compatible with a simple
+    training workflow.
+    """
+
+    engine = LightGBMEngine()
+
+    engine.train(
+        X_train=X_train,
+        y_train=y_train,
+        X_validation=X_validation,
+        y_validation=y_validation,
+    )
+
+    return engine
+
+
+# ============================================================
+# TEST
+# ============================================================
 
 if __name__ == "__main__":
 
+    print("=" * 64)
     print(
         "PRINCE PAUL FX"
     )
-
     print(
-        "LightGBM DigitMatch Engine"
+        "LIGHTGBM ENGINE"
+    )
+    print(
+        "VERSION 2.0"
+    )
+    print("=" * 64)
+
+    engine = LightGBMEngine()
+
+    print()
+    print(
+        "Engine initialized successfully."
+    )
+
+    print()
+    print(
+        "Status:"
     )
 
     print(
-        "Engine loaded successfully."
-    )
-
-    print(
-        f"Classes: {NUM_CLASSES}"
+        json.dumps(
+            engine.status(),
+            indent=2,
+        )
     )
