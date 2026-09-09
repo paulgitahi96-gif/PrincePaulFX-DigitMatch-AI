@@ -3,31 +3,32 @@
 PRINCE PAUL FX
 DIGITMATCH AI ANALYZER
 DERIV HISTORICAL TICKS
-VERSION 2.0
+VERSION 2.1
 ============================================================
 
 Purpose:
-    Download a large historical tick dataset from Deriv
-    using multiple ticks_history requests.
+    Download large historical Deriv tick datasets safely.
 
-Version 2.0 improvements:
+Version 2.1 fixes:
 
-    - Handles the 1,000-tick request limit safely.
-    - Downloads multiple chronological batches.
-    - Retrieves market pip_size.
-    - Uses pip_size for last-digit extraction.
-    - Preserves trailing-zero precision.
-    - Deduplicates historical ticks.
-    - Sorts ticks chronologically.
-    - Saves pip_size in the CSV.
-    - Supports datasets larger than 1,000 ticks.
+    - Removes obsolete active_symbols product_type.
+    - Removes subscribe from one-time ticks_history requests.
+    - Downloads in 1,000-tick batches.
+    - Uses Deriv pip_size when available.
+    - Preserves correct decimal precision.
+    - Deduplicates ticks.
+    - Maintains chronological order.
+    - Saves complete historical datasets.
+    - Provides digit-distribution diagnostics.
 
-This module:
-    - uses public market data
-    - requires no API token
-    - does not place trades
-    - does not train models
-    - does not execute recovery strategies
+No authentication required.
+
+This module does NOT:
+    - place trades
+    - access account funds
+    - execute contracts
+    - train models
+    - implement recovery
 
 ============================================================
 """
@@ -37,6 +38,7 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+from collections import Counter
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -46,7 +48,7 @@ import websockets
 
 
 # ============================================================
-# CONNECTION
+# DERIV CONNECTION
 # ============================================================
 
 PUBLIC_WEBSOCKET_URL = (
@@ -71,7 +73,7 @@ MAX_EMPTY_BATCHES = 3
 
 
 # ============================================================
-# DATA STRUCTURE
+# DATA MODEL
 # ============================================================
 
 @dataclass
@@ -91,33 +93,14 @@ class HistoricalTick:
 
 
 # ============================================================
-# PIP SIZE
+# PIP SIZE NORMALIZATION
 # ============================================================
 
 def normalize_pip_size(
     pip_size,
 ) -> Optional[int]:
     """
-    Convert Deriv pip_size information into the number
-    of decimal places.
-
-    Deriv may expose pip_size as:
-
-        1
-        0.1
-        0.01
-        0.001
-        ...
-
-    or in some responses as an integer precision:
-
-        1
-        2
-        3
-        ...
-
-    The active_symbols response normally provides pip_size
-    as a decimal price increment.
+    Convert Deriv pip_size into decimal precision.
 
     Examples:
 
@@ -125,6 +108,15 @@ def normalize_pip_size(
         0.1     -> 1
         0.01    -> 2
         0.001   -> 3
+
+    Current Deriv responses may also expose pip_size
+    directly as decimal precision, for example:
+
+        2
+        3
+        5
+
+    In that case the integer value is used directly.
     """
 
     if pip_size is None:
@@ -143,44 +135,60 @@ def normalize_pip_size(
 
         return None
 
-    if value <= 0:
+    if value < 0:
         return None
 
-    # Decimal pip increment.
-    if value < 1:
+    # --------------------------------------------------------
+    # Decimal increment format
+    # --------------------------------------------------------
 
-        decimal_places = int(
-            round(
-                -math.log10(
-                    value
-                )
-            )
-        )
+    if (
+        value > 0
+        and value < 1
+    ):
 
-        if (
-            decimal_places >= 0
-            and abs(
-                value
-                - (
-                    10 ** (
-                        -decimal_places
+        try:
+
+            decimal_places = int(
+                round(
+                    -math.log10(
+                        value
                     )
                 )
             )
-            < 1e-9
+
+        except (
+            ValueError,
+            OverflowError,
         ):
+
+            return None
+
+        expected = (
+            10 ** (
+                -decimal_places
+            )
+        )
+
+        if abs(
+            value - expected
+        ) < 1e-9:
+
             return decimal_places
 
-    # Some responses/tools can expose precision
-    # directly as an integer.
+    # --------------------------------------------------------
+    # Direct precision format
+    # --------------------------------------------------------
+
     if value.is_integer():
 
-        integer_value = int(
+        precision = int(
             value
         )
 
-        if 0 <= integer_value <= 10:
-            return integer_value
+        if 0 <= precision <= 10:
+
+            return precision
 
     return None
 
@@ -194,32 +202,30 @@ def extract_last_digit(
     pip_size: Optional[int] = None,
 ) -> int:
     """
-    Extract the actual final displayed decimal digit.
+    Extract the actual final displayed digit.
 
-    pip_size is preferred because Python floats do not preserve
-    trailing zeros.
+    pip_size is used whenever available because converting
+    prices through binary floating point can remove trailing
+    zeros.
 
     Example:
 
-        quote = 123.4
-        pip_size = 2
+        quote = 123.40
+        precision = 2
 
-    Displayed price:
-
-        123.40
-
-    Correct last digit:
+    Result:
 
         0
     """
 
     if quote is None:
+
         raise ValueError(
             "Quote is empty."
         )
 
     # --------------------------------------------------------
-    # Preferred method: Deriv precision
+    # Precision-aware extraction
     # --------------------------------------------------------
 
     if pip_size is not None:
@@ -230,10 +236,9 @@ def extract_last_digit(
                 str(quote)
             )
 
-            scale = Decimal(
-                10
-            ) ** int(
-                pip_size
+            scale = (
+                Decimal(10)
+                ** int(pip_size)
             )
 
             scaled = (
@@ -254,10 +259,11 @@ def extract_last_digit(
             ValueError,
             TypeError,
         ):
+
             pass
 
     # --------------------------------------------------------
-    # Fallback method
+    # Fallback extraction
     # --------------------------------------------------------
 
     quote_string = str(
@@ -265,6 +271,7 @@ def extract_last_digit(
     ).strip()
 
     if not quote_string:
+
         raise ValueError(
             "Empty quote."
         )
@@ -288,13 +295,12 @@ def extract_last_digit(
                 f"{quote}"
             )
 
-    # Remove sign.
     quote_string = (
         quote_string
-        .lstrip("-+")
+        .lstrip("+-")
     )
 
-    # Decimal portion.
+    # Decimal part first.
     if "." in quote_string:
 
         decimal_part = (
@@ -322,6 +328,7 @@ def extract_last_digit(
     ]
 
     if not digits:
+
         raise ValueError(
             f"Unable to extract "
             f"last digit from quote: "
@@ -334,7 +341,7 @@ def extract_last_digit(
 
 
 # ============================================================
-# ACTIVE SYMBOL / PIP SIZE LOOKUP
+# ACTIVE SYMBOL PRECISION
 # ============================================================
 
 async def fetch_market_pip_size(
@@ -342,13 +349,21 @@ async def fetch_market_pip_size(
     market: str,
 ) -> Optional[int]:
     """
-    Ask Deriv for active-symbol metadata and determine
-    the decimal precision for the selected market.
+    Retrieve the selected market's pip_size.
+
+    IMPORTANT:
+        The current Deriv API no longer accepts the old
+        product_type parameter in active_symbols.
+
+    Therefore the request is intentionally minimal:
+
+        {
+            "active_symbols": "brief"
+        }
     """
 
     request = {
         "active_symbols": "brief",
-        "product_type": "basic",
     }
 
     await websocket.send(
@@ -371,7 +386,7 @@ async def fetch_market_pip_size(
 
             raise TimeoutError(
                 "Timed out waiting for "
-                "active_symbols response."
+                "active_symbols."
             )
 
         try:
@@ -387,7 +402,7 @@ async def fetch_market_pip_size(
 
             raise TimeoutError(
                 "Timed out waiting for "
-                "active_symbols response."
+                "active_symbols."
             )
 
         if isinstance(
@@ -443,6 +458,7 @@ async def fetch_market_pip_size(
             message.get("msg_type")
             != "active_symbols"
         ):
+
             continue
 
         symbols = message.get(
@@ -455,8 +471,7 @@ async def fetch_market_pip_size(
         ):
 
             raise RuntimeError(
-                "Deriv returned an invalid "
-                "active_symbols response."
+                "Invalid active_symbols response."
             )
 
         for item in symbols:
@@ -465,13 +480,13 @@ async def fetch_market_pip_size(
                 item,
                 dict,
             ):
+
                 continue
 
             symbol = item.get(
                 "underlying_symbol"
             )
 
-            # Backward-compatible field.
             if symbol is None:
 
                 symbol = item.get(
@@ -481,17 +496,16 @@ async def fetch_market_pip_size(
             if str(symbol) != str(
                 market
             ):
+
                 continue
 
             raw_pip_size = item.get(
                 "pip_size"
             )
 
-            precision = normalize_pip_size(
+            return normalize_pip_size(
                 raw_pip_size
             )
-
-            return precision
 
         raise ValueError(
             f"Market '{market}' was not "
@@ -500,7 +514,7 @@ async def fetch_market_pip_size(
 
 
 # ============================================================
-# HISTORY REQUEST
+# HISTORICAL BATCH REQUEST
 # ============================================================
 
 async def request_history_batch(
@@ -508,14 +522,17 @@ async def request_history_batch(
     market: str,
     count: int,
     end,
-) -> tuple[list[HistoricalTick], Optional[int]]:
+) -> tuple[
+    list[HistoricalTick],
+    Optional[int],
+]:
     """
     Request one historical batch.
 
-    Returns:
+    IMPORTANT:
+        subscribe is intentionally omitted.
 
-        ticks
-        pip_size
+    This is a one-time historical-data request.
     """
 
     request = {
@@ -523,7 +540,6 @@ async def request_history_batch(
         "count": int(count),
         "end": end,
         "style": "ticks",
-        "subscribe": 0,
     }
 
     await websocket.send(
@@ -653,8 +669,8 @@ async def request_history_batch(
         ):
 
             raise RuntimeError(
-                "Historical response does "
-                "not contain prices."
+                "Historical response "
+                "does not contain prices."
             )
 
         if not isinstance(
@@ -663,8 +679,8 @@ async def request_history_batch(
         ):
 
             raise RuntimeError(
-                "Historical response does "
-                "not contain times."
+                "Historical response "
+                "does not contain times."
             )
 
         if len(prices) != len(times):
@@ -674,10 +690,6 @@ async def request_history_batch(
                 "timestamps have different "
                 "lengths."
             )
-
-        # ----------------------------------------------------
-        # pip_size can be returned by ticks_history.
-        # ----------------------------------------------------
 
         response_pip_size = (
             normalize_pip_size(
@@ -700,10 +712,17 @@ async def request_history_batch(
                     quote
                 )
 
+                precision = (
+                    response_pip_size
+                    if response_pip_size
+                    is not None
+                    else None
+                )
+
                 last_digit = (
                     extract_last_digit(
                         quote,
-                        response_pip_size,
+                        precision,
                     )
                 )
 
@@ -720,7 +739,7 @@ async def request_history_batch(
                             last_digit
                         ),
                         pip_size=(
-                            response_pip_size
+                            precision
                             or 0
                         ),
                         raw=message,
@@ -750,9 +769,6 @@ async def request_history_batch(
 # ============================================================
 
 class DerivHistoricalTicks:
-    """
-    Multi-batch Deriv historical tick downloader.
-    """
 
     def __init__(
         self,
@@ -791,7 +807,7 @@ class DerivHistoricalTicks:
 
         all_ticks: dict[
             tuple[int, float],
-            HistoricalTick
+            HistoricalTick,
         ] = {}
 
         async with websockets.connect(
@@ -804,7 +820,7 @@ class DerivHistoricalTicks:
             self.websocket = websocket
 
             # ------------------------------------------------
-            # Determine market precision.
+            # Get market precision.
             # ------------------------------------------------
 
             try:
@@ -829,19 +845,21 @@ class DerivHistoricalTicks:
             if self.pip_size is not None:
 
                 print(
-                    f"Market pip precision: "
-                    f"{self.pip_size} decimal places"
+                    "Market precision: "
+                    f"{self.pip_size} "
+                    "decimal places"
                 )
 
             else:
 
                 print(
-                    "Market pip precision: "
-                    "not available; using fallback"
+                    "Market precision: "
+                    "not available; using "
+                    "response/fallback precision"
                 )
 
             # ------------------------------------------------
-            # Download backwards in batches.
+            # Download batches.
             # ------------------------------------------------
 
             remaining = int(
@@ -863,19 +881,21 @@ class DerivHistoricalTicks:
                     remaining,
                 )
 
+                print()
                 print(
                     f"Downloading batch "
                     f"{batch_number}: "
                     f"{batch_size} ticks..."
                 )
 
-                batch, response_pip_size = (
-                    await request_history_batch(
-                        websocket=websocket,
-                        market=self.market,
-                        count=batch_size,
-                        end=end,
-                    )
+                (
+                    batch,
+                    response_pip_size,
+                ) = await request_history_batch(
+                    websocket=websocket,
+                    market=self.market,
+                    count=batch_size,
+                    end=end,
                 )
 
                 if response_pip_size is not None:
@@ -908,12 +928,6 @@ class DerivHistoricalTicks:
                     continue
 
                 empty_batches = 0
-
-                # ------------------------------------------------
-                # Deduplicate.
-                #
-                # Epoch + quote is used as the tick identity.
-                # ------------------------------------------------
 
                 before = len(
                     all_ticks
@@ -950,15 +964,12 @@ class DerivHistoricalTicks:
                     f"{len(all_ticks)}"
                 )
 
-                # ------------------------------------------------
-                # Stop when enough ticks exist.
-                # ------------------------------------------------
-
                 if len(all_ticks) >= count:
+
                     break
 
                 # ------------------------------------------------
-                # Move historical endpoint backwards.
+                # Move backwards.
                 # ------------------------------------------------
 
                 oldest_epoch = min(
@@ -966,8 +977,6 @@ class DerivHistoricalTicks:
                     for tick in batch
                 )
 
-                # Ask for data before the oldest tick
-                # in the current batch.
                 end = max(
                     1,
                     oldest_epoch - 1,
@@ -978,10 +987,6 @@ class DerivHistoricalTicks:
                     - len(all_ticks)
                 )
 
-            # ----------------------------------------------------
-            # Convert dictionary to chronological list.
-            # ----------------------------------------------------
-
             records = sorted(
                 all_ticks.values(),
                 key=lambda item: (
@@ -989,13 +994,6 @@ class DerivHistoricalTicks:
                     item.quote,
                 ),
             )
-
-            # ----------------------------------------------------
-            # Trim to requested count.
-            #
-            # We downloaded backwards from latest, so keep
-            # the newest requested number after sorting.
-            # ----------------------------------------------------
 
             if len(records) > count:
 
@@ -1046,7 +1044,7 @@ class DerivHistoricalTicks:
 
 
 # ============================================================
-# CONVERSION HELPERS
+# CONVERSION
 # ============================================================
 
 def ticks_to_digits(
@@ -1170,7 +1168,72 @@ def load_digits_csv(
 
 
 # ============================================================
-# DOWNLOAD + SAVE
+# DIGIT DISTRIBUTION
+# ============================================================
+
+def print_digit_summary(
+    ticks: list[HistoricalTick],
+) -> None:
+
+    if not ticks:
+
+        print(
+            "No ticks available."
+        )
+
+        return
+
+    counts = Counter(
+        tick.last_digit
+        for tick in ticks
+    )
+
+    total = len(
+        ticks
+    )
+
+    print()
+    print(
+        "=" * 64
+    )
+
+    print(
+        "DIGIT DISTRIBUTION CHECK"
+    )
+
+    print(
+        "=" * 64
+    )
+
+    for digit in range(
+        10
+    ):
+
+        count = counts.get(
+            digit,
+            0,
+        )
+
+        percentage = (
+            count
+            / total
+            * 100
+        )
+
+        print(
+            f"Digit {digit}: "
+            f"{count:6d} "
+            f"({percentage:6.2f}%)"
+        )
+
+    print()
+    print(
+        f"Total ticks: {total}"
+    )
+
+
+# ============================================================
+# DOWNLOAD AND SAVE
 # ============================================================
 
 def download_and_save(
@@ -1204,75 +1267,6 @@ def download_and_save(
 
 
 # ============================================================
-# DIAGNOSTIC SUMMARY
-# ============================================================
-
-def print_digit_summary(
-    ticks: list[HistoricalTick],
-) -> None:
-
-    if not ticks:
-
-        print(
-            "No ticks available "
-            "for digit summary."
-        )
-
-        return
-
-    from collections import Counter
-
-    counts = Counter(
-        tick.last_digit
-        for tick in ticks
-    )
-
-    print()
-    print(
-        "=" * 64
-    )
-
-    print(
-        "DIGIT DISTRIBUTION CHECK"
-    )
-
-    print(
-        "=" * 64
-    )
-
-    total = len(
-        ticks
-    )
-
-    for digit in range(
-        10
-    ):
-
-        count = counts.get(
-            digit,
-            0,
-        )
-
-        percentage = (
-            count
-            / total
-            * 100
-        )
-
-        print(
-            f"Digit {digit}: "
-            f"{count:6d} "
-            f"({percentage:6.2f}%)"
-        )
-
-    print()
-
-    print(
-        f"Total ticks: {total}"
-    )
-
-
-# ============================================================
 # COMMAND LINE
 # ============================================================
 
@@ -1283,8 +1277,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description=(
             "PRINCE PAUL FX "
-            "Deriv multi-batch "
-            "historical tick downloader"
+            "Deriv historical "
+            "tick downloader"
         )
     )
 
@@ -1292,8 +1286,7 @@ if __name__ == "__main__":
         "--market",
         default=DEFAULT_MARKET,
         help=(
-            "Deriv market symbol. "
-            f"Default: {DEFAULT_MARKET}"
+            "Deriv market symbol."
         ),
     )
 
@@ -1302,9 +1295,8 @@ if __name__ == "__main__":
         type=int,
         default=DEFAULT_COUNT,
         help=(
-            "Number of historical ticks "
-            f"to download. "
-            f"Default: {DEFAULT_COUNT}"
+            "Number of historical "
+            "ticks to download."
         ),
     )
 
@@ -1313,7 +1305,9 @@ if __name__ == "__main__":
         default=(
             "data/historical_ticks.csv"
         ),
-        help="Output CSV path.",
+        help=(
+            "Output CSV path."
+        ),
     )
 
     args = parser.parse_args()
@@ -1331,7 +1325,7 @@ if __name__ == "__main__":
     )
 
     print(
-        "VERSION 2.0"
+        "VERSION 2.1"
     )
 
     print(
@@ -1339,13 +1333,11 @@ if __name__ == "__main__":
     )
 
     print(
-        f"Market: "
-        f"{args.market}"
+        f"Market: {args.market}"
     )
 
     print(
-        f"Requested ticks: "
-        f"{args.count}"
+        f"Requested ticks: {args.count}"
     )
 
     try:
@@ -1361,7 +1353,8 @@ if __name__ == "__main__":
         if not ticks:
 
             raise RuntimeError(
-                "No historical ticks were received."
+                "No historical ticks "
+                "were received."
             )
 
         output = save_ticks_csv(
